@@ -1,0 +1,2396 @@
+// =============================================================================
+// SCHEMA DATABASE — NỀN TẢNG VẬN TẢI
+// =============================================================================
+// Quy tắc bắt buộc (§24.9):
+//   - Khoá nội bộ dùng cuid(); mã công khai sinh ngẫu nhiên ở tầng ứng dụng.
+//   - Tiền dùng Decimal(18,0) theo đơn vị VND. TUYỆT ĐỐI không dùng Float.
+//   - Thời gian lưu UTC; chuyển Asia/Ho_Chi_Minh ở lớp hiển thị.
+//   - Không cascade xoá dữ liệu lịch sử nghiệp vụ; dùng SetNull hoặc Restrict.
+//   - Cột *Normalized phục vụ unique index; cột gốc giữ nguyên cách người dùng nhập.
+//   - Không lưu secret, OTP thô, reset token thô hay presigned URL.
+// =============================================================================
+
+generator client {
+  provider = "prisma-client-js"
+  // Prisma 7: generate vào trong dự án thay vì node_modules. Bắt buộc khi dùng pnpm
+  // vì đường dẫn nested trong .pnpm khiến TypeScript không resolve được type.
+  // Thư mục này do máy sinh ra, đã đưa vào .gitignore.
+  output   = "../src/generated/prisma"
+}
+
+// Prisma 7: connection URL khai báo trong prisma.config.ts, không đặt trong schema.
+datasource db {
+  provider = "postgresql"
+}
+
+// =============================================================================
+// NHÓM 1 — IDENTITY (§24.1)
+// =============================================================================
+
+enum UserRole {
+  CUSTOMER
+  DRIVER
+  DISPATCHER
+  EDITOR
+  ACCOUNTANT
+  ADMIN
+  SUPER_ADMIN
+}
+
+enum UserStatus {
+  PENDING_VERIFICATION
+  ACTIVE
+  SUSPENDED
+  DEACTIVATED
+}
+
+/// Bảng người dùng. Các trường `name`, `email`, `emailVerified`, `image`, `createdAt`,
+/// `updatedAt` do Better Auth quản lý và không được đổi tên (§4: không tự đoán API thư viện).
+model User {
+  id String @id @default(cuid())
+
+  name String
+
+  /// Better Auth yêu cầu email bắt buộc và duy nhất.
+  /// Giá trị lưu ở đây LUÔN đã chuẩn hoá về chữ thường (normalizeEmail) nên chính cột này
+  /// đóng vai trò unique index trên email normalized (§24.9) — không cần cột phụ.
+  email         String  @unique
+  emailVerified Boolean @default(false)
+
+  /// Ảnh đại diện do Better Auth quản lý (nhà cung cấp OAuth trả về).
+  image String?
+
+  phone           String?
+  phoneNormalized String?   @unique
+  phoneVerifiedAt DateTime?
+
+  /// Mật khẩu KHÔNG lưu ở đây. Better Auth lưu hash tại Account.password của bản ghi
+  /// có providerId = "credential".
+  status UserStatus @default(PENDING_VERIFICATION)
+
+  /// Số lần đăng nhập sai liên tiếp, phục vụ khoá tạm thời (§9).
+  failedLoginCount Int       @default(0)
+  lockedUntil      DateTime?
+  lastLoginAt      DateTime?
+
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  /// Vô hiệu hoá tài khoản không xoá lịch sử nghiệp vụ (§9).
+  deletedAt DateTime?
+
+  roles          UserRoleAssignment[]
+  accounts       Account[]
+  sessions       Session[]
+  verifications  Verification[]
+  mfaCredentials MfaCredential[]
+  profile        UserProfile?
+  addresses      UserAddress[]
+  driverProfile  DriverProfile?
+
+  serviceRequests         ServiceRequest[]
+  shipments               Shipment[]
+  supportTickets          SupportTicket[]
+  notifications           Notification[]
+  notificationPreferences NotificationPreference[]
+  consents                ConsentRecord[]
+  dataRequests            DataSubjectRequest[]
+  auditLogs               AuditLog[]
+
+  quotesPrepared    Quote[]         @relation("QuotePreparedBy")
+  quotesApproved    Quote[]         @relation("QuoteApprovedBy")
+  ticketMessages    TicketMessage[]
+  incidentsReported Incident[]      @relation("IncidentReporter")
+  incidentsAssigned Incident[]      @relation("IncidentAssignee")
+  paymentsRecorded  PaymentRecord[]
+  mediaUploaded     ShipmentMedia[]
+
+  @@index([status])
+  @@index([createdAt])
+  @@map("users")
+}
+
+model UserRoleAssignment {
+  id     String   @id @default(cuid())
+  userId String
+  role   UserRole
+
+  grantedAt   DateTime  @default(now())
+  grantedById String?
+  revokedAt   DateTime?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, role])
+  @@index([role, revokedAt])
+  @@map("user_role_assignments")
+}
+
+/// Better Auth quản lý bảng này. Với đăng nhập bằng mật khẩu, providerId = "credential"
+/// và hash mật khẩu nằm ở cột `password`. Với OAuth, providerId là tên nhà cung cấp.
+/// KHÔNG đổi tên cột — Better Auth ánh xạ theo đúng các tên dưới đây.
+model Account {
+  id         String @id @default(cuid())
+  userId     String
+  providerId String
+  accountId  String
+
+  /// Hash mật khẩu do Better Auth tạo và xác minh. Không đọc/ghi cột này thủ công.
+  password String?
+
+  accessToken           String?
+  refreshToken          String?
+  idToken               String?
+  accessTokenExpiresAt  DateTime?
+  refreshTokenExpiresAt DateTime?
+  scope                 String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([providerId, accountId])
+  @@index([userId])
+  @@map("accounts")
+}
+
+/// Better Auth quản lý bảng này. Token phiên nằm trong cookie HttpOnly + Secure,
+/// không bao giờ được đưa vào localStorage hay trả về trong body response (§9).
+model Session {
+  id     String @id @default(cuid())
+  userId String
+
+  token     String   @unique
+  expiresAt DateTime
+  ipAddress String?
+  userAgent String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  /// Cột bổ sung của hệ thống: đăng xuất mọi thiết bị đánh dấu revokedAt thay vì xoá,
+  /// giữ lại vết phiên phục vụ điều tra sự cố bảo mật (§9).
+  revokedAt DateTime?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, revokedAt])
+  @@index([expiresAt])
+  @@map("sessions")
+}
+
+enum VerificationPurpose {
+  EMAIL_VERIFICATION
+  PHONE_VERIFICATION
+  PASSWORD_RESET
+  MAGIC_LINK
+  EMAIL_CHANGE
+}
+
+/// Better Auth quản lý bảng này cho xác minh email, đặt lại mật khẩu và magic link.
+/// Thư viện tự sinh giá trị, kiểm tra hạn và xoá bản ghi sau khi dùng.
+model Verification {
+  id String @id @default(cuid())
+
+  /// Email hoặc số điện thoại đã chuẩn hoá.
+  identifier String
+  /// Giá trị token do Better Auth quản lý vòng đời. Không đọc/ghi thủ công.
+  value      String
+  expiresAt  DateTime
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  /// Các cột bổ sung của hệ thống. Better Auth không set nên đều phải optional
+  /// hoặc có giá trị mặc định — nếu required, thư viện sẽ không insert được.
+  userId     String?
+  purpose    VerificationPurpose?
+  consumedAt DateTime?
+  attempts   Int                  @default(0)
+
+  user User? @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([identifier])
+  @@index([identifier, purpose])
+  @@index([expiresAt])
+  @@map("verifications")
+}
+
+enum MfaType {
+  TOTP
+  RECOVERY_CODE
+}
+
+model MfaCredential {
+  id         String    @id @default(cuid())
+  userId     String
+  type       MfaType
+  /// Secret TOTP đã mã hoá ở tầng ứng dụng, không lưu plaintext.
+  secretEnc  String
+  label      String?
+  verifiedAt DateTime?
+  lastUsedAt DateTime?
+  createdAt  DateTime  @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, type])
+  @@map("mfa_credentials")
+}
+
+model UserProfile {
+  id     String @id @default(cuid())
+  userId String @unique
+
+  companyName  String?
+  taxCode      String?
+  contactName  String?
+  contactPhone String?
+  avatarKey    String?
+  note         String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("user_profiles")
+}
+
+enum AddressType {
+  PICKUP
+  DELIVERY
+  BILLING
+}
+
+model UserAddress {
+  id     String      @id @default(cuid())
+  userId String
+  type   AddressType @default(PICKUP)
+
+  label        String?
+  contactName  String?
+  contactPhone String?
+  line         String
+  ward         String?
+  district     String?
+  province     String
+  postalCode   String?
+
+  latitude  Decimal? @db.Decimal(10, 7)
+  longitude Decimal? @db.Decimal(10, 7)
+
+  isDefault Boolean   @default(false)
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, type, deletedAt])
+  @@map("user_addresses")
+}
+
+// =============================================================================
+// NHÓM 2 — CMS (§24.2)
+// =============================================================================
+
+enum PublishStatus {
+  DRAFT
+  SCHEDULED
+  PUBLISHED
+  ARCHIVED
+}
+
+/// Bản ghi duy nhất chứa thông tin pháp nhân. Nội dung do quản trị viên nhập (§1).
+model CompanyProfile {
+  id String @id @default(cuid())
+
+  legalName   String
+  brandName   String
+  slogan      String?
+  description String?
+
+  taxCode          String?
+  businessLicense  String?
+  /// Giấy phép kinh doanh vận tải, nếu doanh nghiệp công bố.
+  transportLicense String?
+
+  logoKey           String?
+  faviconKey        String?
+  defaultOgImageKey String?
+
+  /// Đánh dấu trường nào còn là nội dung chờ doanh nghiệp cập nhật (§1).
+  pendingFields String[] @default([])
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("company_profile")
+}
+
+model Office {
+  id   String @id @default(cuid())
+  name String
+  /// HEAD_OFFICE, BRANCH, DEPOT, YARD — kiểm soát ở tầng ứng dụng để dễ mở rộng.
+  kind String @default("BRANCH")
+
+  line     String
+  ward     String?
+  district String?
+  province String
+
+  latitude  Decimal? @db.Decimal(10, 7)
+  longitude Decimal? @db.Decimal(10, 7)
+
+  phone        String?
+  email        String?
+  workingHours String?
+
+  isPublic  Boolean  @default(true)
+  sortOrder Int      @default(0)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([isPublic, sortOrder])
+  @@map("offices")
+}
+
+enum ContactChannelType {
+  HOTLINE
+  PHONE
+  EMAIL
+  ZALO
+  FACEBOOK
+  YOUTUBE
+  TIKTOK
+  OTHER
+}
+
+model ContactChannel {
+  id    String             @id @default(cuid())
+  type  ContactChannelType
+  label String
+  value String
+  /// Link đầy đủ khi type là mạng xã hội.
+  url   String?
+
+  isPrimary Boolean  @default(false)
+  isActive  Boolean  @default(true)
+  sortOrder Int      @default(0)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([isActive, sortOrder])
+  @@index([type, isActive])
+  @@map("contact_channels")
+}
+
+model Service {
+  id   String @id @default(cuid())
+  slug String @unique
+  name String
+
+  shortDescription String
+  description      String
+  /// Tên icon trong bộ lucide-react.
+  icon             String?
+  coverImageKey    String?
+  highlights       String[] @default([])
+
+  /// Bật dịch vụ chuyển nhà/văn phòng thì form khảo sát riêng mới hiển thị (§12).
+  isMovingService Boolean @default(false)
+
+  status    PublishStatus @default(DRAFT)
+  sortOrder Int           @default(0)
+
+  seoTitle       String?
+  seoDescription String?
+
+  publishedAt DateTime?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  serviceRequests ServiceRequest[]
+  vehicleRates    VehicleRate[]
+
+  @@index([status, sortOrder])
+  @@map("services")
+}
+
+model ServiceArea {
+  id       String  @id @default(cuid())
+  slug     String  @unique
+  name     String
+  province String
+  district String?
+
+  description String?
+  /// Ghi chú điều kiện phục vụ khu vực này.
+  note        String?
+
+  status    PublishStatus @default(DRAFT)
+  sortOrder Int           @default(0)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  priceZones PriceZoneArea[]
+
+  @@index([status, province])
+  @@map("service_areas")
+}
+
+model Faq {
+  id       String  @id @default(cuid())
+  question String
+  answer   String
+  category String?
+
+  status    PublishStatus @default(DRAFT)
+  sortOrder Int           @default(0)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([status, sortOrder])
+  @@map("faqs")
+}
+
+model StaticPage {
+  id      String @id @default(cuid())
+  slug    String @unique
+  title   String
+  /// HTML đã sanitize ở tầng ứng dụng trước khi lưu (§10).
+  content String
+
+  seoTitle       String?
+  seoDescription String?
+  canonicalUrl   String?
+
+  status      PublishStatus @default(DRAFT)
+  publishedAt DateTime?
+  createdAt   DateTime      @default(now())
+  updatedAt   DateTime      @updatedAt
+
+  @@index([status])
+  @@map("static_pages")
+}
+
+/// Khối nội dung có thể sắp xếp trên trang chủ và một số trang tĩnh.
+model SiteSection {
+  id   String @id @default(cuid())
+  key  String @unique
+  page String @default("home")
+
+  title    String?
+  subtitle String?
+  body     String?
+  /// Dữ liệu cấu hình riêng theo từng loại khối.
+  config   Json?
+
+  isVisible Boolean  @default(true)
+  sortOrder Int      @default(0)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([page, isVisible, sortOrder])
+  @@map("site_sections")
+}
+
+enum MediaKind {
+  IMAGE
+  VIDEO
+  DOCUMENT
+}
+
+/// Thư viện media dùng cho CMS. Media của chuyến hàng nằm ở ShipmentMedia.
+model MediaAsset {
+  id        String    @id @default(cuid())
+  kind      MediaKind @default(IMAGE)
+  objectKey String    @unique
+
+  fileName  String?
+  mimeType  String
+  sizeBytes Int
+  width     Int?
+  height    Int?
+  checksum  String?
+
+  altText   String?
+  caption   String?
+  credit    String?
+  /// Trang nguồn/giấy phép khi dùng ảnh stock (§27).
+  sourceUrl String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  newsPosts NewsPost[]
+
+  @@index([kind, createdAt])
+  @@map("media_assets")
+}
+
+model NewsCategory {
+  id          String  @id @default(cuid())
+  slug        String  @unique
+  name        String
+  description String?
+  sortOrder   Int     @default(0)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  posts NewsPost[]
+
+  @@map("news_categories")
+}
+
+model NewsTag {
+  id   String @id @default(cuid())
+  slug String @unique
+  name String
+
+  createdAt DateTime @default(now())
+
+  posts NewsPost[] @relation("NewsPostTags")
+
+  @@map("news_tags")
+}
+
+model NewsPost {
+  id      String  @id @default(cuid())
+  slug    String  @unique
+  title   String
+  excerpt String?
+  /// HTML đã sanitize (§22).
+  body    String
+
+  categoryId   String?
+  coverImageId String?
+  authorName   String?
+
+  status      PublishStatus @default(DRAFT)
+  publishedAt DateTime?
+
+  seoTitle       String?
+  seoDescription String?
+  canonicalUrl   String?
+  socialImageKey String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  category   NewsCategory? @relation(fields: [categoryId], references: [id], onDelete: SetNull)
+  coverImage MediaAsset?   @relation(fields: [coverImageId], references: [id], onDelete: SetNull)
+  tags       NewsTag[]     @relation("NewsPostTags")
+
+  @@index([status, publishedAt])
+  @@index([categoryId, status])
+  @@map("news_posts")
+}
+
+// =============================================================================
+// NHÓM 3 — SERVICE REQUEST & QUOTE (§24.3)
+// =============================================================================
+
+enum ServiceRequestStatus {
+  DRAFT
+  SUBMITTED
+  UNDER_REVIEW
+  NEED_MORE_INFO
+  QUOTED
+  NEGOTIATING
+  ACCEPTED
+  CONVERTED_TO_SHIPMENT
+  REJECTED
+  EXPIRED
+  CANCELLED
+}
+
+enum RequestKind {
+  FREIGHT
+  MOVING
+}
+
+model ServiceRequest {
+  id   String      @id @default(cuid())
+  /// Mã công khai ngẫu nhiên, không tuần tự (§24.9).
+  code String      @unique
+  kind RequestKind @default(FREIGHT)
+
+  /// Null khi khách gửi lúc chưa đăng nhập (§11).
+  userId    String?
+  serviceId String?
+
+  contactName            String
+  contactPhone           String
+  contactPhoneNormalized String
+  contactEmail           String?
+  companyName            String?
+
+  requestedVehicleTypeId String?
+  preferredPickupAt      DateTime?
+  preferredDeliveryAt    DateTime?
+
+  needsLoading  Boolean @default(false)
+  needsPacking  Boolean @default(false)
+  needsAssembly Boolean @default(false)
+  needsHoisting Boolean @default(false)
+
+  declaredValue Decimal? @db.Decimal(18, 0)
+  note          String?
+
+  status ServiceRequestStatus @default(DRAFT)
+
+  /// Token truy cập an toàn cho khách chưa đăng nhập, lưu dạng hash (§11).
+  guestAccessTokenHash String?   @unique
+  guestTokenExpiresAt  DateTime?
+
+  submittedAt DateTime?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  user                 User?        @relation(fields: [userId], references: [id], onDelete: SetNull)
+  service              Service?     @relation(fields: [serviceId], references: [id], onDelete: SetNull)
+  requestedVehicleType VehicleType? @relation(fields: [requestedVehicleTypeId], references: [id], onDelete: SetNull)
+
+  stops        RequestStop[]
+  cargoItems   CargoItem[]
+  movingDetail MovingRequestDetail?
+  attachments  RequestAttachment[]
+  statusEvents RequestStatusEvent[]
+  quotes       Quote[]
+  shipment     Shipment?
+
+  @@index([userId, status, createdAt])
+  @@index([status, createdAt])
+  @@index([contactPhoneNormalized])
+  @@map("service_requests")
+}
+
+enum StopKind {
+  PICKUP
+  DELIVERY
+  WAYPOINT
+}
+
+model RequestStop {
+  id               String   @id @default(cuid())
+  serviceRequestId String
+  kind             StopKind
+  sequence         Int      @default(0)
+
+  contactName  String?
+  contactPhone String?
+
+  line     String
+  ward     String?
+  district String?
+  province String
+
+  latitude  Decimal? @db.Decimal(10, 7)
+  longitude Decimal? @db.Decimal(10, 7)
+
+  /// Điều kiện tiếp cận ảnh hưởng chi phí bốc xếp (§11).
+  floorNumber    Int?
+  hasElevator    Boolean?
+  carryDistanceM Int?
+  accessNote     String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  serviceRequest ServiceRequest @relation(fields: [serviceRequestId], references: [id], onDelete: Cascade)
+
+  @@index([serviceRequestId, sequence])
+  @@map("request_stops")
+}
+
+model CargoItem {
+  id               String @id @default(cuid())
+  serviceRequestId String
+
+  cargoType String
+  quantity  Int     @default(1)
+  weightKg  Decimal @db.Decimal(12, 2)
+
+  lengthCm Int?
+  widthCm  Int?
+  heightCm Int?
+  volumeM3 Decimal? @db.Decimal(10, 3)
+
+  isFragile  Boolean @default(false)
+  isValuable Boolean @default(false)
+  note       String?
+
+  createdAt DateTime @default(now())
+
+  serviceRequest ServiceRequest @relation(fields: [serviceRequestId], references: [id], onDelete: Cascade)
+
+  @@index([serviceRequestId])
+  @@map("cargo_items")
+}
+
+model MovingRequestDetail {
+  id               String @id @default(cuid())
+  serviceRequestId String @unique
+
+  /// HOUSE, APARTMENT, ROOM, OFFICE — kiểm soát ở tầng ứng dụng.
+  propertyType String
+
+  originFloor          Int?
+  originHasElevator    Boolean?
+  originCarryDistanceM Int?
+
+  destinationFloor          Int?
+  destinationHasElevator    Boolean?
+  destinationCarryDistanceM Int?
+
+  preferredDate     DateTime?
+  preferredTimeSlot String?
+
+  needsCartons     Boolean @default(false)
+  cartonQuantity   Int?
+  needsPacking     Boolean @default(false)
+  needsDisassembly Boolean @default(false)
+  needsCleaning    Boolean @default(false)
+
+  requestsSiteSurvey Boolean   @default(false)
+  surveyScheduledAt  DateTime?
+  surveyCompletedAt  DateTime?
+  /// Ghi chú của nhân viên sau khảo sát; không ghi đè dữ liệu khách đã xác nhận (§12).
+  surveyNote         String?
+
+  note String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  serviceRequest ServiceRequest        @relation(fields: [serviceRequestId], references: [id], onDelete: Cascade)
+  inventoryItems MovingInventoryItem[]
+
+  @@map("moving_request_details")
+}
+
+model MovingInventoryItem {
+  id                    String @id @default(cuid())
+  movingRequestDetailId String
+
+  /// FURNITURE, APPLIANCE, ELECTRONICS, BOX, FRAGILE, OTHER.
+  category String
+  name     String
+  quantity Int    @default(1)
+
+  estimatedLengthCm Int?
+  estimatedWidthCm  Int?
+  estimatedHeightCm Int?
+  estimatedWeightKg Decimal? @db.Decimal(10, 2)
+
+  isFragile        Boolean @default(false)
+  isHighValue      Boolean @default(false)
+  needsDisassembly Boolean @default(false)
+  note             String?
+
+  /// Phân biệt mục do khách khai và mục nhân viên bổ sung sau khảo sát (§12).
+  addedByStaff Boolean @default(false)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  movingRequestDetail MovingRequestDetail @relation(fields: [movingRequestDetailId], references: [id], onDelete: Cascade)
+
+  @@index([movingRequestDetailId, category])
+  @@map("moving_inventory_items")
+}
+
+enum AttachmentStatus {
+  QUARANTINED
+  PROCESSING
+  READY
+  REJECTED
+}
+
+model RequestAttachment {
+  id               String @id @default(cuid())
+  serviceRequestId String
+
+  objectKey String    @unique
+  kind      MediaKind @default(IMAGE)
+  mimeType  String
+  sizeBytes Int
+  checksum  String?
+  caption   String?
+
+  status AttachmentStatus @default(QUARANTINED)
+
+  uploadedAt DateTime @default(now())
+
+  serviceRequest ServiceRequest @relation(fields: [serviceRequestId], references: [id], onDelete: Cascade)
+
+  @@index([serviceRequestId, status])
+  @@map("request_attachments")
+}
+
+model RequestStatusEvent {
+  id               String                @id @default(cuid())
+  serviceRequestId String
+  fromStatus       ServiceRequestStatus?
+  toStatus         ServiceRequestStatus
+
+  actorId   String?
+  actorRole UserRole?
+  reason    String?
+  metadata  Json?
+
+  occurredAt DateTime @default(now())
+
+  serviceRequest ServiceRequest @relation(fields: [serviceRequestId], references: [id], onDelete: Cascade)
+
+  @@index([serviceRequestId, occurredAt])
+  @@map("request_status_events")
+}
+
+enum QuoteStatus {
+  DRAFT
+  PENDING_APPROVAL
+  SENT
+  VIEWED
+  NEGOTIATING
+  ACCEPTED
+  DECLINED
+  EXPIRED
+  CANCELLED
+}
+
+model Quote {
+  id   String @id @default(cuid())
+  code String @unique
+
+  serviceRequestId String
+
+  status QuoteStatus @default(DRAFT)
+
+  /// Trỏ tới revision đang có hiệu lực. Lịch sử giữ trong QuoteRevision (§13.3).
+  currentRevisionId  String? @unique
+  /// Snapshot revision khách đã chấp nhận; không được sửa sau khi set.
+  acceptedRevisionId String? @unique
+
+  preparedById String?
+  approvedById String?
+
+  sentAt     DateTime?
+  viewedAt   DateTime?
+  acceptedAt DateTime?
+  declinedAt DateTime?
+  expiresAt  DateTime?
+
+  declineReason String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  serviceRequest ServiceRequest @relation(fields: [serviceRequestId], references: [id], onDelete: Restrict)
+  preparedBy     User?          @relation("QuotePreparedBy", fields: [preparedById], references: [id], onDelete: SetNull)
+  approvedBy     User?          @relation("QuoteApprovedBy", fields: [approvedById], references: [id], onDelete: SetNull)
+
+  currentRevision  QuoteRevision? @relation("QuoteCurrentRevision", fields: [currentRevisionId], references: [id], onDelete: SetNull)
+  acceptedRevision QuoteRevision? @relation("QuoteAcceptedRevision", fields: [acceptedRevisionId], references: [id], onDelete: SetNull)
+
+  revisions  QuoteRevision[] @relation("QuoteRevisions")
+  messages   QuoteMessage[]
+  activities QuoteActivity[]
+  shipment   Shipment?
+  invoices   Invoice[]
+
+  @@index([serviceRequestId, status])
+  @@index([status, createdAt])
+  @@map("quotes")
+}
+
+model QuoteRevision {
+  id             String @id @default(cuid())
+  quoteId        String
+  revisionNumber Int
+
+  subtotal       Decimal @default(0) @db.Decimal(18, 0)
+  discountAmount Decimal @default(0) @db.Decimal(18, 0)
+  taxAmount      Decimal @default(0) @db.Decimal(18, 0)
+  totalAmount    Decimal @default(0) @db.Decimal(18, 0)
+  currency       String  @default("VND")
+
+  /// Phiên bản bảng giá dùng để tính, giữ lại để đối chiếu về sau (§13.3).
+  priceCatalogVersionId String?
+
+  terms String?
+  note  String?
+
+  createdById String?
+  createdAt   DateTime  @default(now())
+  /// Sau khi khách chấp nhận, revision bị khoá; muốn đổi phải tạo revision mới (§13.3).
+  lockedAt    DateTime?
+
+  quote               Quote                @relation("QuoteRevisions", fields: [quoteId], references: [id], onDelete: Cascade)
+  priceCatalogVersion PriceCatalogVersion? @relation(fields: [priceCatalogVersionId], references: [id], onDelete: SetNull)
+  lineItems           QuoteLineItem[]
+
+  currentOfQuote  Quote? @relation("QuoteCurrentRevision")
+  acceptedOfQuote Quote? @relation("QuoteAcceptedRevision")
+
+  @@unique([quoteId, revisionNumber])
+  @@index([quoteId, createdAt])
+  @@map("quote_revisions")
+}
+
+model QuoteLineItem {
+  id              String @id @default(cuid())
+  quoteRevisionId String
+  sequence        Int    @default(0)
+
+  description String
+  /// TRANSPORT, LABOR, PACKING, SURCHARGE, DISCOUNT, OTHER.
+  category    String @default("TRANSPORT")
+
+  quantity  Decimal @default(1) @db.Decimal(12, 2)
+  unit      String
+  unitPrice Decimal @db.Decimal(18, 0)
+
+  discountAmount Decimal @default(0) @db.Decimal(18, 0)
+  taxPercent     Decimal @default(0) @db.Decimal(5, 2)
+  lineTotal      Decimal @db.Decimal(18, 0)
+
+  note String?
+
+  createdAt DateTime @default(now())
+
+  quoteRevision QuoteRevision @relation(fields: [quoteRevisionId], references: [id], onDelete: Cascade)
+
+  @@index([quoteRevisionId, sequence])
+  @@map("quote_line_items")
+}
+
+enum MessageVisibility {
+  INTERNAL
+  CUSTOMER_VISIBLE
+}
+
+model QuoteMessage {
+  id      String @id @default(cuid())
+  quoteId String
+
+  authorId   String?
+  authorRole UserRole?
+  visibility MessageVisibility @default(CUSTOMER_VISIBLE)
+  body       String
+
+  createdAt DateTime @default(now())
+
+  quote Quote @relation(fields: [quoteId], references: [id], onDelete: Cascade)
+
+  @@index([quoteId, createdAt])
+  @@map("quote_messages")
+}
+
+model QuoteActivity {
+  id      String @id @default(cuid())
+  quoteId String
+
+  /// CREATED, REVISED, SUBMITTED_FOR_APPROVAL, APPROVED, SENT, VIEWED, ACCEPTED, DECLINED.
+  action    String
+  actorId   String?
+  actorRole UserRole?
+  metadata  Json?
+
+  occurredAt DateTime @default(now())
+
+  quote Quote @relation(fields: [quoteId], references: [id], onDelete: Cascade)
+
+  @@index([quoteId, occurredAt])
+  @@map("quote_activities")
+}
+
+// =============================================================================
+// NHÓM 4 — PRICING (§24.4)
+// =============================================================================
+
+model PriceCatalog {
+  id          String  @id @default(cuid())
+  slug        String  @unique
+  name        String
+  description String?
+  isActive    Boolean @default(true)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  versions PriceCatalogVersion[]
+
+  @@map("price_catalogs")
+}
+
+model PriceCatalogVersion {
+  id             String @id @default(cuid())
+  priceCatalogId String
+  versionNumber  Int
+
+  effectiveFrom DateTime
+  effectiveTo   DateTime?
+
+  status        PublishStatus @default(DRAFT)
+  publishedAt   DateTime?
+  publishedById String?
+
+  /// Ghi rõ khi dữ liệu chưa đủ để công bố giá chính thức (§13.1).
+  isReferenceOnly Boolean @default(true)
+  note            String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  priceCatalog PriceCatalog @relation(fields: [priceCatalogId], references: [id], onDelete: Cascade)
+
+  vehicleRates   VehicleRate[]
+  routeRates     RouteRate[]
+  laborRates     LaborRate[]
+  surchargeRules SurchargeRule[]
+  quoteRevisions QuoteRevision[]
+
+  @@unique([priceCatalogId, versionNumber])
+  @@index([status, effectiveFrom])
+  @@map("price_catalog_versions")
+}
+
+model VehicleRate {
+  id                    String @id @default(cuid())
+  priceCatalogVersionId String
+
+  vehicleTypeId String?
+  serviceId     String?
+  priceZoneId   String?
+
+  /// TRIP, KM, HOUR, TONNE, M3.
+  unit      String
+  basePrice Decimal @db.Decimal(18, 0)
+  unitPrice Decimal @default(0) @db.Decimal(18, 0)
+
+  minimumKm    Decimal? @db.Decimal(10, 2)
+  minimumHours Decimal? @db.Decimal(6, 2)
+  includedKm   Decimal? @db.Decimal(10, 2)
+
+  note String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  priceCatalogVersion PriceCatalogVersion @relation(fields: [priceCatalogVersionId], references: [id], onDelete: Cascade)
+  vehicleType         VehicleType?        @relation(fields: [vehicleTypeId], references: [id], onDelete: SetNull)
+  service             Service?            @relation(fields: [serviceId], references: [id], onDelete: SetNull)
+  priceZone           PriceZone?          @relation(fields: [priceZoneId], references: [id], onDelete: SetNull)
+
+  @@index([priceCatalogVersionId, vehicleTypeId])
+  @@map("vehicle_rates")
+}
+
+model RouteRate {
+  id                    String @id @default(cuid())
+  priceCatalogVersionId String
+
+  originProvince      String
+  destinationProvince String
+  vehicleTypeId       String?
+
+  price          Decimal  @db.Decimal(18, 0)
+  estimatedKm    Decimal? @db.Decimal(10, 2)
+  estimatedHours Decimal? @db.Decimal(6, 2)
+  note           String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  priceCatalogVersion PriceCatalogVersion @relation(fields: [priceCatalogVersionId], references: [id], onDelete: Cascade)
+  vehicleType         VehicleType?        @relation(fields: [vehicleTypeId], references: [id], onDelete: SetNull)
+
+  @@index([priceCatalogVersionId, originProvince, destinationProvince])
+  @@map("route_rates")
+}
+
+model LaborRate {
+  id                    String @id @default(cuid())
+  priceCatalogVersionId String
+
+  name String
+  /// HOUR, SHIFT, TONNE, M3, PACKAGE, FLOOR, TRIP.
+  unit String
+
+  price          Decimal  @db.Decimal(18, 0)
+  minimumWorkers Int?
+  minimumHours   Decimal? @db.Decimal(6, 2)
+
+  /// Loại hàng không nhận, điều kiện an toàn (§13.2).
+  safetyNote String?
+  exclusions String[] @default([])
+  note       String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  priceCatalogVersion PriceCatalogVersion @relation(fields: [priceCatalogVersionId], references: [id], onDelete: Cascade)
+
+  @@index([priceCatalogVersionId])
+  @@map("labor_rates")
+}
+
+model SurchargeRule {
+  id                    String @id @default(cuid())
+  priceCatalogVersionId String
+
+  code String
+  name String
+  /// TOLL, WAITING, NIGHT, HOLIDAY, ALLEY, FLOOR, LOADING, PACKING, HEAVY_ITEM, STAIRS, CARRY_DISTANCE.
+  kind String
+
+  /// FIXED hoặc PERCENT.
+  calculationType String  @default("FIXED")
+  amount          Decimal @default(0) @db.Decimal(18, 0)
+  percent         Decimal @default(0) @db.Decimal(5, 2)
+  unit            String?
+
+  /// Điều kiện áp dụng, ví dụ ngưỡng tầng hoặc khung giờ.
+  conditions Json?
+  note       String?
+
+  isActive  Boolean @default(true)
+  sortOrder Int     @default(0)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  priceCatalogVersion PriceCatalogVersion @relation(fields: [priceCatalogVersionId], references: [id], onDelete: Cascade)
+
+  @@unique([priceCatalogVersionId, code])
+  @@index([priceCatalogVersionId, isActive])
+  @@map("surcharge_rules")
+}
+
+model PriceZone {
+  id          String  @id @default(cuid())
+  slug        String  @unique
+  name        String
+  description String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  areas        PriceZoneArea[]
+  vehicleRates VehicleRate[]
+
+  @@map("price_zones")
+}
+
+model PriceZoneArea {
+  priceZoneId   String
+  serviceAreaId String
+
+  priceZone   PriceZone   @relation(fields: [priceZoneId], references: [id], onDelete: Cascade)
+  serviceArea ServiceArea @relation(fields: [serviceAreaId], references: [id], onDelete: Cascade)
+
+  @@id([priceZoneId, serviceAreaId])
+  @@map("price_zone_areas")
+}
+
+// =============================================================================
+// NHÓM 5 — FLEET (§24.5)
+// =============================================================================
+
+enum VehicleCategory {
+  LIGHT_TRUCK
+  MEDIUM_TRUCK
+  HEAVY_TRUCK
+  BOX_TRUCK
+  TARPAULIN_TRUCK
+  SPECIALIZED
+}
+
+model VehicleType {
+  id       String          @id @default(cuid())
+  slug     String          @unique
+  name     String
+  category VehicleCategory
+
+  description  String?
+  /// Null khi doanh nghiệp chưa cung cấp số liệu thật (§1, §14.1).
+  payloadKg    Int?
+  bodyLengthCm Int?
+  bodyWidthCm  Int?
+  bodyHeightCm Int?
+  volumeM3     Decimal? @db.Decimal(8, 2)
+  /// CLOSED_BOX, TARPAULIN, FLATBED, REFRIGERATED, TANK.
+  bodyType     String?
+
+  suitableFor String[] @default([])
+  imageKey    String?
+
+  status    PublishStatus @default(DRAFT)
+  sortOrder Int           @default(0)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  vehicles        Vehicle[]
+  vehicleRates    VehicleRate[]
+  routeRates      RouteRate[]
+  serviceRequests ServiceRequest[]
+  shipments       Shipment[]
+
+  @@index([status, sortOrder])
+  @@index([category])
+  @@map("vehicle_types")
+}
+
+enum VehicleStatus {
+  ACTIVE
+  INACTIVE
+  MAINTENANCE
+  RETIRED
+}
+
+model Vehicle {
+  id            String @id @default(cuid())
+  vehicleTypeId String
+
+  plateNumber           String
+  /// Biển số đã bỏ dấu phân cách và viết hoa, dùng cho unique index (§24.9).
+  plateNumberNormalized String @unique
+
+  status VehicleStatus @default(ACTIVE)
+
+  brand           String?
+  model           String?
+  manufactureYear Int?
+
+  inspectionExpiresAt DateTime?
+  insuranceExpiresAt  DateTime?
+
+  internalNote String?
+
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+
+  vehicleType VehicleType @relation(fields: [vehicleTypeId], references: [id], onDelete: Restrict)
+
+  documents          VehicleDocument[]
+  maintenances       VehicleMaintenance[]
+  availabilityBlocks AvailabilityBlock[]
+  assignments        ShipmentAssignment[]
+
+  @@index([status, vehicleTypeId])
+  @@index([inspectionExpiresAt])
+  @@index([insuranceExpiresAt])
+  @@map("vehicles")
+}
+
+model VehicleDocument {
+  id        String @id @default(cuid())
+  vehicleId String
+
+  /// REGISTRATION, INSPECTION, INSURANCE, PERMIT, OTHER.
+  kind      String
+  /// Object private, chỉ nhân viên có quyền xem (§14.2).
+  objectKey String @unique
+  mimeType  String
+  sizeBytes Int
+
+  documentNumber String?
+  issuedAt       DateTime?
+  expiresAt      DateTime?
+  note           String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  vehicle Vehicle @relation(fields: [vehicleId], references: [id], onDelete: Cascade)
+
+  @@index([vehicleId, kind])
+  @@index([expiresAt])
+  @@map("vehicle_documents")
+}
+
+model VehicleMaintenance {
+  id        String @id @default(cuid())
+  vehicleId String
+
+  /// SCHEDULED, REPAIR, INSPECTION.
+  kind        String
+  scheduledAt DateTime
+  completedAt DateTime?
+
+  odometerKm  Int?
+  cost        Decimal? @db.Decimal(18, 0)
+  description String?
+  note        String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  vehicle Vehicle @relation(fields: [vehicleId], references: [id], onDelete: Cascade)
+
+  @@index([vehicleId, scheduledAt])
+  @@map("vehicle_maintenances")
+}
+
+enum DriverStatus {
+  ACTIVE
+  ON_LEAVE
+  SUSPENDED
+  INACTIVE
+}
+
+model DriverProfile {
+  id     String @id @default(cuid())
+  userId String @unique
+
+  employeeCode        String @unique
+  fullName            String
+  workPhone           String
+  workPhoneNormalized String @unique
+
+  licenseClass     String?
+  licenseNumber    String?
+  licenseExpiresAt DateTime?
+
+  status DriverStatus @default(ACTIVE)
+
+  /// Chỉ nhân viên có quyền được xem (§14.2).
+  emergencyContactName  String?
+  emergencyContactPhone String?
+
+  internalNote String?
+
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  documents            DriverDocument[]
+  availabilityBlocks   AvailabilityBlock[]
+  primaryAssignments   ShipmentAssignment[] @relation("PrimaryDriver")
+  secondaryAssignments ShipmentAssignment[] @relation("SecondaryDriver")
+
+  @@index([status])
+  @@index([licenseExpiresAt])
+  @@map("driver_profiles")
+}
+
+model DriverDocument {
+  id              String @id @default(cuid())
+  driverProfileId String
+
+  /// LICENSE, ID_CARD, HEALTH_CERT, CONTRACT, OTHER.
+  kind      String
+  objectKey String @unique
+  mimeType  String
+  sizeBytes Int
+
+  documentNumber String?
+  issuedAt       DateTime?
+  expiresAt      DateTime?
+  note           String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  driverProfile DriverProfile @relation(fields: [driverProfileId], references: [id], onDelete: Cascade)
+
+  @@index([driverProfileId, kind])
+  @@index([expiresAt])
+  @@map("driver_documents")
+}
+
+enum AvailabilityKind {
+  MAINTENANCE
+  LEAVE
+  RESERVED
+  OTHER
+}
+
+/// Khoảng thời gian xe/tài xế không nhận chuyến. Dùng khi kiểm tra double-booking (§14.3).
+model AvailabilityBlock {
+  id              String  @id @default(cuid())
+  vehicleId       String?
+  driverProfileId String?
+
+  kind     AvailabilityKind @default(OTHER)
+  startsAt DateTime
+  endsAt   DateTime
+  reason   String?
+
+  createdById String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  vehicle       Vehicle?       @relation(fields: [vehicleId], references: [id], onDelete: Cascade)
+  driverProfile DriverProfile? @relation(fields: [driverProfileId], references: [id], onDelete: Cascade)
+
+  @@index([vehicleId, startsAt, endsAt])
+  @@index([driverProfileId, startsAt, endsAt])
+  @@map("availability_blocks")
+}
+
+// =============================================================================
+// NHÓM 6 — SHIPMENT (§24.6)
+// =============================================================================
+
+enum ShipmentStatus {
+  CREATED
+  CONFIRMED
+  SCHEDULED
+  DRIVER_ASSIGNED
+  EN_ROUTE_TO_PICKUP
+  AT_PICKUP
+  PICKUP_INSPECTION
+  PACKING
+  LOADING
+  SECURED_ON_VEHICLE
+  IN_TRANSIT
+  AT_DELIVERY
+  UNLOADING
+  DELIVERED_PENDING_CONFIRMATION
+  COMPLETED
+  ON_HOLD
+  INCIDENT
+  FAILED
+  CANCELLED
+}
+
+model Shipment {
+  id           String @id @default(cuid())
+  /// Mã tra cứu ngẫu nhiên, không tuần tự (§15).
+  trackingCode String @unique
+
+  userId           String?
+  serviceRequestId String? @unique
+  quoteId          String? @unique
+  vehicleTypeId    String?
+
+  status ShipmentStatus @default(CREATED)
+
+  scheduledPickupAt   DateTime?
+  actualPickupAt      DateTime?
+  estimatedDeliveryAt DateTime?
+  deliveredAt         DateTime?
+  completedAt         DateTime?
+
+  totalAmount Decimal? @db.Decimal(18, 0)
+  currency    String   @default("VND")
+
+  /// Cho phép khách xem vị trí chuyến hay không (§17).
+  locationSharingEnabled Boolean @default(false)
+
+  instructions String?
+  internalNote String?
+
+  cancelReasonCode String?
+  cancelReason     String?
+
+  /// Optimistic concurrency cho cập nhật dễ xung đột (§25).
+  version Int @default(0)
+
+  createdById String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  user           User?           @relation(fields: [userId], references: [id], onDelete: SetNull)
+  serviceRequest ServiceRequest? @relation(fields: [serviceRequestId], references: [id], onDelete: SetNull)
+  quote          Quote?          @relation(fields: [quoteId], references: [id], onDelete: SetNull)
+  vehicleType    VehicleType?    @relation(fields: [vehicleTypeId], references: [id], onDelete: SetNull)
+
+  stops           ShipmentStop[]
+  assignments     ShipmentAssignment[]
+  statusEvents    ShipmentStatusEvent[]
+  media           ShipmentMedia[]
+  locationPings   LocationPing[]
+  proofOfPickup   ProofOfPickup?
+  /// Nhiều bản qua các lần điều chỉnh; bản đang hiệu lực có `supersededAt = null` (§18).
+  proofOfDeliveries ProofOfDelivery[]
+  deliveryOtps    DeliveryOtp[]
+  incidents       Incident[]
+  supportTickets  SupportTicket[]
+  invoices        Invoice[]
+
+  @@index([userId, status, createdAt])
+  @@index([status, scheduledPickupAt])
+  @@index([createdAt])
+  @@map("shipments")
+}
+
+model ShipmentStop {
+  id         String   @id @default(cuid())
+  shipmentId String
+  kind       StopKind
+  sequence   Int      @default(0)
+
+  contactName  String?
+  contactPhone String?
+
+  line     String
+  ward     String?
+  district String?
+  province String
+
+  latitude  Decimal? @db.Decimal(10, 7)
+  longitude Decimal? @db.Decimal(10, 7)
+
+  floorNumber    Int?
+  hasElevator    Boolean?
+  carryDistanceM Int?
+  accessNote     String?
+
+  scheduledAt DateTime?
+  arrivedAt   DateTime?
+  completedAt DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  shipment Shipment @relation(fields: [shipmentId], references: [id], onDelete: Cascade)
+
+  @@index([shipmentId, sequence])
+  @@map("shipment_stops")
+}
+
+/// Lịch sử phân công. Đổi tài xế/xe tạo bản ghi mới thay vì sửa bản cũ (§14.3).
+model ShipmentAssignment {
+  id         String @id @default(cuid())
+  shipmentId String
+
+  vehicleId         String?
+  primaryDriverId   String?
+  secondaryDriverId String?
+
+  /// Khoảng thời gian hiệu lực, dùng để kiểm tra trùng lịch.
+  effectiveFrom DateTime
+  effectiveTo   DateTime
+
+  isActive Boolean @default(true)
+
+  /// Ghi nhận khi dispatcher bỏ qua cảnh báo trùng lịch (§14.3).
+  overrideConflict Boolean @default(false)
+  overrideReason   String?
+
+  assignedById String?
+  releasedAt   DateTime?
+  note         String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  shipment        Shipment       @relation(fields: [shipmentId], references: [id], onDelete: Cascade)
+  vehicle         Vehicle?       @relation(fields: [vehicleId], references: [id], onDelete: SetNull)
+  primaryDriver   DriverProfile? @relation("PrimaryDriver", fields: [primaryDriverId], references: [id], onDelete: SetNull)
+  secondaryDriver DriverProfile? @relation("SecondaryDriver", fields: [secondaryDriverId], references: [id], onDelete: SetNull)
+
+  locationPings LocationPing[]
+
+  @@index([shipmentId, isActive])
+  @@index([vehicleId, isActive, effectiveFrom, effectiveTo])
+  @@index([primaryDriverId, isActive, effectiveFrom, effectiveTo])
+  @@map("shipment_assignments")
+}
+
+enum EventSource {
+  DRIVER_APP
+  STAFF_PORTAL
+  SYSTEM
+  CUSTOMER
+}
+
+model ShipmentStatusEvent {
+  id         String          @id @default(cuid())
+  shipmentId String
+  fromStatus ShipmentStatus?
+  toStatus   ShipmentStatus
+
+  actorId   String?
+  actorRole UserRole?
+  source    EventSource @default(SYSTEM)
+
+  note       String?
+  reasonCode String?
+
+  latitude  Decimal? @db.Decimal(10, 7)
+  longitude Decimal? @db.Decimal(10, 7)
+
+  occurredAt DateTime @default(now())
+
+  shipment Shipment @relation(fields: [shipmentId], references: [id], onDelete: Cascade)
+
+  @@index([shipmentId, occurredAt])
+  @@map("shipment_status_events")
+}
+
+enum MediaStage {
+  BEFORE_PICKUP
+  PICKUP_INSPECTION
+  PACKING
+  LOADING
+  SECURING
+  IN_TRANSIT
+  UNLOADING
+  DELIVERY
+  DAMAGE_EVIDENCE
+  PROOF_OF_DELIVERY
+}
+
+enum MediaVisibility {
+  INTERNAL
+  CUSTOMER
+}
+
+enum MediaStatus {
+  QUARANTINED
+  PROCESSING
+  READY
+  REJECTED
+}
+
+model ShipmentMedia {
+  id         String     @id @default(cuid())
+  shipmentId String
+  stage      MediaStage
+  kind       MediaKind  @default(IMAGE)
+
+  /// Object key do server sinh, không dựa vào tên file người dùng (§16.3).
+  objectKey       String  @unique
+  /// MIME đã xác minh bằng magic bytes phía server, không tin Content-Type client gửi.
+  mimeType        String
+  sizeBytes       Int
+  checksum        String?
+  width           Int?
+  height          Int?
+  durationSeconds Int?
+
+  thumbnailKey String?
+  posterKey    String?
+
+  caption      String?
+  visibility   MediaVisibility @default(INTERNAL)
+  status       MediaStatus     @default(QUARANTINED)
+  rejectReason String?
+
+  uploadedById String?
+  capturedAt   DateTime?
+  uploadedAt   DateTime  @default(now())
+
+  shipment   Shipment @relation(fields: [shipmentId], references: [id], onDelete: Cascade)
+  uploadedBy User?    @relation(fields: [uploadedById], references: [id], onDelete: SetNull)
+
+  @@index([shipmentId, stage, status])
+  @@index([shipmentId, visibility, status])
+  @@map("shipment_media")
+}
+
+model LocationPing {
+  id           String  @id @default(cuid())
+  shipmentId   String
+  assignmentId String?
+
+  latitude  Decimal  @db.Decimal(10, 7)
+  longitude Decimal  @db.Decimal(10, 7)
+  accuracyM Decimal? @db.Decimal(8, 2)
+  speedKph  Decimal? @db.Decimal(6, 2)
+  heading   Decimal? @db.Decimal(6, 2)
+
+  /// Thời điểm thiết bị ghi nhận. Không tin tuyệt đối, phải đối chiếu receivedAt (§17).
+  recordedAt DateTime
+  receivedAt DateTime @default(now())
+
+  shipment   Shipment            @relation(fields: [shipmentId], references: [id], onDelete: Cascade)
+  assignment ShipmentAssignment? @relation(fields: [assignmentId], references: [id], onDelete: SetNull)
+
+  @@index([shipmentId, recordedAt])
+  @@index([recordedAt])
+  @@map("location_pings")
+}
+
+model ProofOfPickup {
+  id         String @id @default(cuid())
+  shipmentId String @unique
+
+  senderName     String?
+  senderRelation String?
+  signatureKey   String?
+  note           String?
+
+  packageCount Int?
+  condition    String?
+
+  latitude  Decimal? @db.Decimal(10, 7)
+  longitude Decimal? @db.Decimal(10, 7)
+
+  recordedById String?
+  recordedAt   DateTime  @default(now())
+  /// Snapshot bất biến sau khi hoàn tất; sửa phải qua quy trình correction (§18).
+  finalizedAt  DateTime?
+
+  shipment Shipment @relation(fields: [shipmentId], references: [id], onDelete: Cascade)
+
+  @@map("proof_of_pickups")
+}
+
+enum DeliveryOutcome {
+  DELIVERED_FULL
+  DELIVERED_PARTIAL
+  REFUSED
+}
+
+/// Biên bản giao hàng. Bản đã chốt KHÔNG sửa được: điều chỉnh tạo bản mới trỏ về bản cũ
+/// qua `correctionOfId`, bản cũ được đánh dấu `supersededAt` (§18).
+///
+/// Vì vậy `shipmentId` KHÔNG unique — một chuyến có thể có nhiều bản qua các lần điều chỉnh.
+/// Ràng buộc "chỉ một bản đang hiệu lực" do partial unique index ở tầng database giữ.
+model ProofOfDelivery {
+  id         String @id @default(cuid())
+  shipmentId String
+
+  receiverName     String
+  receiverRelation String?
+
+  outcome         DeliveryOutcome @default(DELIVERED_FULL)
+  exceptionReason String?
+
+  signatureKey String?
+  note         String?
+  condition    String?
+
+  otpVerifiedAt DateTime?
+
+  latitude  Decimal? @db.Decimal(10, 7)
+  longitude Decimal? @db.Decimal(10, 7)
+
+  recordedById String?
+  recordedAt   DateTime  @default(now())
+  finalizedAt  DateTime?
+
+  /// Thời điểm bản này bị một bản điều chỉnh thay thế. Null nghĩa là đang hiệu lực.
+  supersededAt DateTime?
+
+  /// Bản ghi sửa chữa sau khi đã chốt, giữ vết thay đổi (§18).
+  correctionOfId   String? @unique
+  correctionReason String?
+
+  shipment     Shipment         @relation(fields: [shipmentId], references: [id], onDelete: Cascade)
+  correctionOf ProofOfDelivery? @relation("PodCorrection", fields: [correctionOfId], references: [id], onDelete: SetNull)
+  correctedBy  ProofOfDelivery? @relation("PodCorrection")
+
+  @@index([shipmentId, supersededAt])
+  @@map("proof_of_deliveries")
+}
+
+model DeliveryOtp {
+  id         String @id @default(cuid())
+  shipmentId String
+
+  /// Chỉ lưu hash, OTP thô chỉ gửi qua SMS/Zalo (§18).
+  otpHash     String
+  expiresAt   DateTime
+  attempts    Int       @default(0)
+  maxAttempts Int       @default(5)
+  consumedAt  DateTime?
+
+  sentToPhone String?
+  createdAt   DateTime @default(now())
+
+  shipment Shipment @relation(fields: [shipmentId], references: [id], onDelete: Cascade)
+
+  @@index([shipmentId, expiresAt])
+  @@map("delivery_otps")
+}
+
+enum IncidentType {
+  DELAY
+  VEHICLE_BREAKDOWN
+  ACCIDENT
+  DAMAGE
+  LOSS
+  ACCESS_ISSUE
+  CUSTOMER_UNAVAILABLE
+  OTHER
+}
+
+enum IncidentSeverity {
+  LOW
+  MEDIUM
+  HIGH
+  CRITICAL
+}
+
+enum IncidentStatus {
+  OPEN
+  INVESTIGATING
+  ACTION_REQUIRED
+  RESOLVED
+  CLOSED
+}
+
+model Incident {
+  id   String @id @default(cuid())
+  code String @unique
+
+  shipmentId String?
+  type       IncidentType
+  severity   IncidentSeverity @default(MEDIUM)
+  status     IncidentStatus   @default(OPEN)
+
+  reportedById String?
+  assigneeId   String?
+
+  title       String
+  description String
+
+  latitude  Decimal? @db.Decimal(10, 7)
+  longitude Decimal? @db.Decimal(10, 7)
+
+  occurredAt DateTime
+  resolvedAt DateTime?
+  resolution String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  shipment   Shipment? @relation(fields: [shipmentId], references: [id], onDelete: SetNull)
+  reportedBy User?     @relation("IncidentReporter", fields: [reportedById], references: [id], onDelete: SetNull)
+  assignee   User?     @relation("IncidentAssignee", fields: [assigneeId], references: [id], onDelete: SetNull)
+
+  media IncidentMedia[]
+
+  @@index([status, severity, createdAt])
+  @@index([shipmentId])
+  @@map("incidents")
+}
+
+model IncidentMedia {
+  id         String @id @default(cuid())
+  incidentId String
+
+  objectKey String    @unique
+  kind      MediaKind @default(IMAGE)
+  mimeType  String
+  sizeBytes Int
+  checksum  String?
+  caption   String?
+
+  status MediaStatus @default(QUARANTINED)
+
+  uploadedById String?
+  uploadedAt   DateTime @default(now())
+
+  incident Incident @relation(fields: [incidentId], references: [id], onDelete: Cascade)
+
+  @@index([incidentId, status])
+  @@map("incident_media")
+}
+
+// =============================================================================
+// NHÓM 7 — CUSTOMER SERVICE & FINANCE (§24.7)
+// =============================================================================
+
+enum ContactInquiryStatus {
+  NEW
+  IN_PROGRESS
+  RESOLVED
+  SPAM
+}
+
+model ContactInquiry {
+  id String @id @default(cuid())
+
+  name            String
+  phone           String
+  phoneNormalized String
+  email           String?
+  subject         String
+  message         String
+
+  status       ContactInquiryStatus @default(NEW)
+  assigneeId   String?
+  internalNote String?
+
+  /// Nguồn: contact-form, hotline, zalo...
+  source String @default("contact-form")
+
+  /// Liên kết khi inquiry được chuyển thành yêu cầu dịch vụ (§23).
+  convertedRequestId String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([status, createdAt])
+  @@index([phoneNormalized])
+  @@map("contact_inquiries")
+}
+
+enum TicketType {
+  QUESTION
+  COMPLAINT
+  COMPENSATION
+  INVOICE
+  OTHER
+}
+
+enum TicketPriority {
+  LOW
+  NORMAL
+  HIGH
+  URGENT
+}
+
+enum TicketStatus {
+  OPEN
+  WAITING_FOR_STAFF
+  WAITING_FOR_CUSTOMER
+  RESOLVED
+  CLOSED
+}
+
+model SupportTicket {
+  id   String @id @default(cuid())
+  code String @unique
+
+  userId     String
+  shipmentId String?
+
+  type     TicketType     @default(QUESTION)
+  priority TicketPriority @default(NORMAL)
+  status   TicketStatus   @default(OPEN)
+
+  subject String
+
+  assigneeId String?
+  /// Hạn phản hồi theo SLA nội bộ cấu hình được (§19).
+  slaDueAt   DateTime?
+
+  firstRespondedAt DateTime?
+  resolvedAt       DateTime?
+  closedAt         DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user     User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  shipment Shipment? @relation(fields: [shipmentId], references: [id], onDelete: SetNull)
+
+  messages TicketMessage[]
+
+  @@index([userId, status])
+  @@index([status, priority, createdAt])
+  @@index([assigneeId, status])
+  @@map("support_tickets")
+}
+
+model TicketMessage {
+  id       String @id @default(cuid())
+  ticketId String
+
+  authorId   String?
+  authorRole UserRole?
+  /// Ghi chú nội bộ không được hiển thị cho khách (§19).
+  visibility MessageVisibility @default(CUSTOMER_VISIBLE)
+  body       String
+
+  createdAt DateTime @default(now())
+
+  ticket      SupportTicket      @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+  author      User?              @relation(fields: [authorId], references: [id], onDelete: SetNull)
+  attachments TicketAttachment[]
+
+  @@index([ticketId, createdAt])
+  @@map("ticket_messages")
+}
+
+model TicketAttachment {
+  id        String @id @default(cuid())
+  messageId String
+
+  objectKey String    @unique
+  kind      MediaKind @default(DOCUMENT)
+  mimeType  String
+  sizeBytes Int
+  fileName  String?
+
+  status MediaStatus @default(QUARANTINED)
+
+  uploadedAt DateTime @default(now())
+
+  message TicketMessage @relation(fields: [messageId], references: [id], onDelete: Cascade)
+
+  @@index([messageId])
+  @@map("ticket_attachments")
+}
+
+enum InvoiceStatus {
+  DRAFT
+  ISSUED
+  PARTIALLY_PAID
+  PAID
+  OVERDUE
+  VOID
+}
+
+model Invoice {
+  id            String @id @default(cuid())
+  /// Mã chứng từ nội bộ. KHÔNG phải hoá đơn điện tử hợp pháp (§20).
+  invoiceNumber String @unique
+
+  userId     String?
+  shipmentId String?
+  quoteId    String?
+
+  /// Snapshot thông tin xuất hoá đơn tại thời điểm phát hành (§20).
+  billingName    String
+  billingTaxCode String?
+  billingAddress String?
+  billingEmail   String?
+
+  status InvoiceStatus @default(DRAFT)
+
+  issuedAt DateTime?
+  dueAt    DateTime?
+
+  subtotal       Decimal @default(0) @db.Decimal(18, 0)
+  discountAmount Decimal @default(0) @db.Decimal(18, 0)
+  taxAmount      Decimal @default(0) @db.Decimal(18, 0)
+  totalAmount    Decimal @default(0) @db.Decimal(18, 0)
+  paidAmount     Decimal @default(0) @db.Decimal(18, 0)
+  balanceAmount  Decimal @default(0) @db.Decimal(18, 0)
+  currency       String  @default("VND")
+
+  note         String?
+  internalNote String?
+  voidReason   String?
+
+  version Int @default(0)
+
+  createdById String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  shipment Shipment? @relation(fields: [shipmentId], references: [id], onDelete: SetNull)
+  quote    Quote?    @relation(fields: [quoteId], references: [id], onDelete: SetNull)
+
+  lines    InvoiceLine[]
+  payments PaymentRecord[]
+
+  @@index([userId, status])
+  @@index([status, dueAt])
+  @@map("invoices")
+}
+
+model InvoiceLine {
+  id        String @id @default(cuid())
+  invoiceId String
+  sequence  Int    @default(0)
+
+  description String
+  quantity    Decimal @default(1) @db.Decimal(12, 2)
+  unit        String
+  unitPrice   Decimal @db.Decimal(18, 0)
+
+  discountAmount Decimal @default(0) @db.Decimal(18, 0)
+  taxPercent     Decimal @default(0) @db.Decimal(5, 2)
+  lineTotal      Decimal @db.Decimal(18, 0)
+
+  createdAt DateTime @default(now())
+
+  invoice Invoice @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+
+  @@index([invoiceId, sequence])
+  @@map("invoice_lines")
+}
+
+enum PaymentMethod {
+  CASH
+  BANK_TRANSFER
+  OTHER
+}
+
+enum PaymentStatus {
+  PENDING
+  CONFIRMED
+  REVERSED
+}
+
+model PaymentRecord {
+  id        String @id @default(cuid())
+  invoiceId String
+
+  amount   Decimal       @db.Decimal(18, 0)
+  currency String        @default("VND")
+  method   PaymentMethod @default(BANK_TRANSFER)
+  status   PaymentStatus @default(PENDING)
+
+  referenceCode String?
+  paidAt        DateTime
+  note          String?
+
+  /// Chứng từ private, xem qua signed URL (§20).
+  attachmentKey String?
+
+  recordedById  String?
+  reversedAt    DateTime?
+  reverseReason String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  invoice    Invoice @relation(fields: [invoiceId], references: [id], onDelete: Restrict)
+  recordedBy User?   @relation(fields: [recordedById], references: [id], onDelete: SetNull)
+
+  @@index([invoiceId, status])
+  @@index([paidAt])
+  @@map("payment_records")
+}
+
+// =============================================================================
+// NHÓM 8 — SYSTEM (§24.8)
+// =============================================================================
+
+enum NotificationChannel {
+  IN_APP
+  EMAIL
+  SMS
+  ZALO
+}
+
+enum NotificationSeverity {
+  INFO
+  SUCCESS
+  WARNING
+  ERROR
+}
+
+model Notification {
+  id     String @id @default(cuid())
+  userId String
+
+  /// Khoá sự kiện, ví dụ: quote.sent, shipment.delivered.
+  eventKey String
+  severity NotificationSeverity @default(INFO)
+
+  title   String
+  body    String
+  /// Đường dẫn nội bộ khi bấm vào thông báo.
+  linkUrl String?
+
+  readAt    DateTime?
+  createdAt DateTime  @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, readAt, createdAt])
+  @@map("notifications")
+}
+
+model NotificationPreference {
+  id     String @id @default(cuid())
+  userId String
+
+  eventKey String
+  channel  NotificationChannel
+  enabled  Boolean             @default(true)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, eventKey, channel])
+  @@map("notification_preferences")
+}
+
+model NotificationTemplate {
+  id       String              @id @default(cuid())
+  eventKey String
+  channel  NotificationChannel
+  locale   String              @default("vi")
+  version  Int                 @default(1)
+
+  subject  String?
+  bodyText String
+  bodyHtml String?
+
+  isActive Boolean @default(true)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([eventKey, channel, locale, version])
+  @@index([eventKey, channel, isActive])
+  @@map("notification_templates")
+}
+
+enum OutboxStatus {
+  PENDING
+  PROCESSING
+  SENT
+  FAILED
+  DEAD_LETTER
+}
+
+/// Ghi cùng transaction với nghiệp vụ để không mất side effect (§21).
+model OutboxEvent {
+  id String @id @default(cuid())
+
+  eventKey      String
+  aggregateType String
+  aggregateId   String
+  payload       Json
+
+  status      OutboxStatus @default(PENDING)
+  attempts    Int          @default(0)
+  maxAttempts Int          @default(5)
+  nextRetryAt DateTime?
+  lastError   String?
+
+  /// Chống gửi trùng khi worker retry (§21).
+  idempotencyKey String @unique
+
+  processedAt DateTime?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  @@index([status, nextRetryAt])
+  @@index([aggregateType, aggregateId])
+  @@map("outbox_events")
+}
+
+/// Append-only ở tầng ứng dụng. Không chứa password, token, OTP, cookie (§30.3).
+model AuditLog {
+  id String @id @default(cuid())
+
+  actorId   String?
+  actorRole UserRole?
+
+  action       String
+  resourceType String
+  resourceId   String?
+
+  /// Đã lọc bỏ trường nhạy cảm trước khi ghi.
+  beforeData Json?
+  afterData  Json?
+
+  ipAddress String?
+  userAgent String?
+  requestId String?
+
+  createdAt DateTime @default(now())
+
+  actor User? @relation(fields: [actorId], references: [id], onDelete: SetNull)
+
+  @@index([resourceType, resourceId, createdAt])
+  @@index([actorId, createdAt])
+  @@index([action, createdAt])
+  @@map("audit_logs")
+}
+
+/// Chống xử lý trùng khi client retry request có Idempotency-Key (§25).
+model IdempotencyRecord {
+  id String @id @default(cuid())
+
+  key      String
+  endpoint String
+  userId   String?
+
+  /// Hash của request body, phát hiện cùng key nhưng khác payload.
+  requestHash  String
+  responseCode Int?
+  responseBody Json?
+
+  status    String   @default("IN_PROGRESS")
+  expiresAt DateTime
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([key, endpoint])
+  @@index([expiresAt])
+  @@map("idempotency_records")
+}
+
+model ConsentRecord {
+  id     String  @id @default(cuid())
+  userId String?
+
+  /// PRIVACY_POLICY, TERMS, MARKETING, COOKIE_ANALYTICS, LOCATION_SHARING.
+  consentType String
+  version     String
+  granted     Boolean
+
+  ipAddress String?
+  userAgent String?
+
+  grantedAt DateTime  @default(now())
+  revokedAt DateTime?
+
+  user User? @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@index([userId, consentType])
+  @@map("consent_records")
+}
+
+enum DataSubjectRequestType {
+  ACCESS
+  RECTIFICATION
+  EXPORT
+  DELETION
+}
+
+enum DataSubjectRequestStatus {
+  RECEIVED
+  VERIFYING
+  IN_PROGRESS
+  COMPLETED
+  REJECTED
+}
+
+model DataSubjectRequest {
+  id     String  @id @default(cuid())
+  userId String?
+
+  type   DataSubjectRequestType
+  status DataSubjectRequestStatus @default(RECEIVED)
+
+  contactEmail String
+  note         String?
+
+  handledById String?
+  /// Kết quả xử lý, ví dụ đường dẫn tệp export đã hết hạn hoặc lý do từ chối.
+  resolution  String?
+
+  completedAt DateTime?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  user User? @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@index([status, createdAt])
+  @@map("data_subject_requests")
+}
+
+/// Cấu hình hệ thống theo allowlist key. TUYỆT ĐỐI không chứa secret (§24.8).
+model SystemSetting {
+  key   String @id
+  value Json
+
+  /// Cho phép đọc từ phía client hay không.
+  isPublic    Boolean @default(false)
+  description String?
+
+  updatedById String?
+  updatedAt   DateTime @updatedAt
+
+  @@index([isPublic])
+  @@map("system_settings")
+}

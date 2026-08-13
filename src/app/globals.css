@@ -1,0 +1,135 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+
+:root {
+  /* Base palette */
+  --color-navy: #0b1f33;
+  --color-navy-light: #163a5f;
+  --color-orange: #f97316;
+  --color-orange-hover: #ea580c;
+  /* Cam #F97316 làm CHỮ trên nền sáng chỉ đạt 2.80:1 — không đạt WCAG AA.
+     Dùng biến này cho mọi văn bản/link màu cam đặt trên nền sáng (5.18:1). */
+  --color-orange-text: #c2410c;
+  --color-orange-text-hover: #9a3412;
+  --color-bg: #f7f9fc;
+  --color-text: #142033;
+  --color-success: #15803d;
+  --color-success-bg: #ecfdf3;
+  --color-warning: #b45309;
+  --color-warning-bg: #fffbeb;
+  --color-error: #b91c1c;
+  --color-error-bg: #fef2f2;
+  --color-border: #e2e8f0;
+
+  /* Chữ phụ. KHÔNG dùng text-muted..60 thay cho token này: các mức opacity đó
+     chỉ đạt 2.4–4.4:1, dưới ngưỡng WCAG AA 4.5:1 cho chữ thường (§29).
+     Token này đạt 5.69:1 trên nền #f7f9fc và 6.00:1 trên nền trắng. */
+  --color-muted: #5a6472;
+
+  --background: var(--color-bg);
+  --foreground: var(--color-text);
+  --radius: 0.625rem;
+}
+
+@theme inline {
+  --font-sans: var(--font-be-vietnam-pro);
+
+  --color-background: var(--color-bg);
+  --color-foreground: var(--color-text);
+
+  --color-navy: var(--color-navy);
+  --color-navy-light: var(--color-navy-light);
+  --color-orange: var(--color-orange);
+  --color-orange-hover: var(--color-orange-hover);
+  --color-orange-text: var(--color-orange-text);
+  --color-orange-text-hover: var(--color-orange-text-hover);
+  --color-success: var(--color-success);
+  --color-success-bg: var(--color-success-bg);
+  --color-warning: var(--color-warning);
+  --color-warning-bg: var(--color-warning-bg);
+  --color-error: var(--color-error);
+  --color-error-bg: var(--color-error-bg);
+  --color-border: var(--color-border);
+  --color-muted: var(--color-muted);
+
+  --radius-sm: calc(var(--radius) - 0.25rem);
+  --radius-md: calc(var(--radius) - 0.125rem);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 0.25rem);
+
+  --container-content: 1280px;
+}
+
+body {
+  background: var(--background);
+  color: var(--foreground);
+  font-family: var(--font-sans), "Segoe UI", sans-serif;
+}
+
+* {
+  border-color: var(--color-border);
+}
+
+::selection {
+  background: var(--color-orange);
+  color: white;
+}
+
+/* width:100% là bắt buộc — không có nó, box sẽ giãn theo min-content của nội dung
+   (vd: bảng min-w-[720px]) và gây cuộn ngang toàn trang trên màn hình hẹp. */
+.container-content {
+  width: 100%;
+  max-width: var(--container-content);
+  margin-inline: auto;
+  padding-inline: 1rem;
+}
+
+@media (min-width: 768px) {
+  .container-content {
+    padding-inline: 1.5rem;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+.skip-link {
+  position: absolute;
+  left: -9999px;
+  top: 0;
+  z-index: 100;
+  background: var(--color-navy);
+  color: white;
+  padding: 0.75rem 1.25rem;
+  border-radius: 0 0 var(--radius-md) 0;
+}
+
+.skip-link:focus {
+  left: 0;
+}
+
+@keyframes accordion-down {
+  from {
+    height: 0;
+  }
+  to {
+    height: var(--radix-accordion-content-height);
+  }
+}
+
+@keyframes accordion-up {
+  from {
+    height: var(--radix-accordion-content-height);
+  }
+  to {
+    height: 0;
+  }
+}

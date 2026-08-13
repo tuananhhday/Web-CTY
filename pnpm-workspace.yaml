@@ -1,0 +1,13 @@
+# pnpm chặn postinstall script mặc định (chống supply-chain attack).
+# Chỉ cấp phép cho package thực sự cần chạy script khi cài:
+#   - @prisma/engines / prisma: tải query engine binary, bắt buộc để Prisma hoạt động
+#   - unrs-resolver: native binding của eslint-config-next
+#   - esbuild: tải native binary, bắt buộc để Vitest chạy
+allowBuilds:
+  '@prisma/engines': true
+  esbuild: true
+  prisma: true
+  unrs-resolver: true
+
+minimumReleaseAgeExclude:
+  - lucide-react@1.31.0

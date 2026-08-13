@@ -1,0 +1,49 @@
+# Dịch vụ hạ tầng cho môi trường DEVELOPMENT.
+# Không dùng file này cho production: mật khẩu ở đây là giá trị local, cổng mở ra host.
+#
+#   pnpm db:up     khởi động PostgreSQL
+#   pnpm db:down   dừng và gỡ container
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    container_name: vantai_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-vantai}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-vantai_local_dev}
+      POSTGRES_DB: ${POSTGRES_DB:-vantai}
+      # Sắp xếp theo chuẩn C để index hoạt động ổn định giữa các máy.
+      POSTGRES_INITDB_ARGS: "--locale-provider=icu --icu-locale=vi-VN --encoding=UTF8"
+    ports:
+      - "${POSTGRES_PORT:-5433}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-vantai} -d ${POSTGRES_DB:-vantai}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  # Redis là tuỳ chọn (§4): chỉ cần khi bật rate limit phân tán / queue.
+  # Mặc định ứng dụng dùng adapter in-memory nên không bắt buộc chạy service này.
+  # Khởi động riêng khi cần:  docker compose --profile redis up -d
+  redis:
+    image: redis:8-alpine
+    container_name: vantai_redis
+    restart: unless-stopped
+    profiles: ["redis"]
+    ports:
+      - "${REDIS_PORT:-6380}:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  postgres_data:
+  redis_data:
